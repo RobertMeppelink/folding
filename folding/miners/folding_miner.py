@@ -189,12 +189,21 @@ class FoldingMiner(BaseMinerNeuron):
         output_dir = os.path.join(self.base_data_path, synapse.pdb_id)
 
         if len(self.simulations) > 0:
-            # check if any of the simulations have finished
+            # Create a list to hold the keys of simulations to be removed
+            finished_simulations = []
+        
             for pdb_id, simulation in self.simulations.items():
-                current_executor_state = simulation["executor"].get_state()
-                if current_executor_state == "finished":
-                    bt.logging.debug(f"✅ Removing {pdb_id} from execution stack ✅")
-                    del self.simulations[pdb_id]
+                try:
+                    current_executor_state = simulation["executor"].get_state()
+                    if current_executor_state == "finished":
+                        bt.logging.debug(f"✅ Removing {pdb_id} from execution stack ✅")
+                        finished_simulations.append(pdb_id)
+                except Exception as e:
+                    bt.logging.error(f"Error checking state of simulation {pdb_id}: {e}")
+        
+            # Remove the finished simulations after the iteration
+            for pdb_id in finished_simulations:
+                del self.simulations[pdb_id]
 
             bt.logging.warning(f"Simulations Running: {list(self.simulations.keys())}")
 
