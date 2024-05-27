@@ -264,6 +264,9 @@ class FoldingMiner(BaseMinerNeuron):
         self.simulations[synapse.pdb_id]["output_dir"] = simulation_manager.output_dir
 
         bt.logging.debug(f"✅ New pdb_id {synapse.pdb_id} submitted to job executor ✅ ")
+        return check_synapse(
+            synapse=synapse
+        )  # return the synapse for quick turn around.
 
     async def blacklist(self, synapse: FoldingSynapse) -> Tuple[bool, str]:
         if (
