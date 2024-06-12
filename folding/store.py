@@ -89,7 +89,14 @@ class PandasJobStore:
         return queue
 
     def insert(
-        self, pdb: str, ff: str, box: str, water: str, hotkeys: List[str], **kwargs
+        self,
+        pdb: str,
+        ff: str,
+        box: str,
+        water: str,
+        hotkeys: List[str],
+        epsilon: float,
+        **kwargs,
     ):
         """Adds a new job to the database."""
 
@@ -104,6 +111,7 @@ class PandasJobStore:
             hotkeys=hotkeys,
             created_at=pd.Timestamp.now().floor("s"),
             updated_at=pd.Timestamp.now().floor("s"),
+            epsilon=epsilon,
             **kwargs,
         ).to_frame()
 
@@ -147,6 +155,7 @@ class Job:
     updated_count: int = 0
     max_time_no_improvement: pd.Timedelta = pd.Timedelta(minutes=60)
     min_updates: int = 10
+    epsilon: float = 5e3
     event: dict = None
 
     def to_dict(self):
@@ -169,20 +178,43 @@ class Job:
         self.updated_at = pd.Timestamp.now().floor("s")
         self.updated_count += 1
 
-        # TODO: make epsilon a param, or a class attrib
-        epsilon = 1e2
-        if loss < self.best_loss - epsilon:
+        if loss < self.best_loss - self.epsilon:
             self.best_loss = loss
             self.best_loss_at = pd.Timestamp.now().floor("s")
             self.best_hotkey = hotkey
             self.commit_hash = commit_hash
             self.gro_hash = gro_hash
-        elif (
+        elif (  # if loss has been improved but not recently enough, trigger early stopping
             pd.Timestamp.now().floor("s") - self.best_loss_at
             > self.max_time_no_improvement
             and self.updated_count >= self.min_updates
         ):
             self.active = False
+        elif (  # if loss has never been improved and the job has been running a long time, trigger early stopping
+            isinstance(
+                self.best_loss_at, pd._libs.tslibs.nattype.NaTType
+            )  # a best loss has not been assigned
+            and pd.Timestamp.now().floor("s") - self.created_at
+            > self.max_time_no_improvement  # the time since the last best loss is greater than the max allowed time
+        ):
+            self.active = False
+
+    def check_for_available_hotkeys(self, hotkeys: List[str]) -> bool:
+        """Checks the job's hotkeys to only include those that are still valid. This permanently removes hotkeys from a job. If no hotkeys are left, the job is set to inactive.
+        
+        Returns:
+            bool : True if there are remaining hotkeys in the job, and False if there are none.
+        """
+
+        # Get the list of hotkeys that are still valid and set the attribute.
+        self.hotkeys = list(set(self.hotkeys) & set(hotkeys))
+
+        # If no hotkeys are left, set the job to inactive and return False
+        if not self.hotkeys:
+            self.active = False
+            return False
+
+        return True
 
 
 class MockJob(Job):

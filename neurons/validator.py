@@ -28,6 +28,7 @@ import bittensor as bt
 
 from folding.store import PandasJobStore
 from folding.utils.uids import get_random_uids
+from folding.rewards.reward_pipeline import reward_pipeline
 from folding.validators.forward import create_new_challenge, run_step
 from folding.validators.protein import Protein
 
@@ -65,6 +66,24 @@ class Validator(BaseValidatorNeuron):
 
         return mdrun_args
 
+    def get_uids(self, hotkeys: List[str]) -> List[int]:
+        """Returns the uids corresponding to the hotkeys.
+        It is possible that some hotkeys have been dereg'd,
+        so we need to check for them in the metagraph.
+
+        Args:
+            hotkeys (List[str]): List of hotkeys
+
+        Returns:
+            List[int]: List of uids
+        """
+        return [
+            self.metagraph.hotkeys.index(hotkey)
+            for hotkey in hotkeys
+            if hotkey in self.metagraph.hotkeys
+            and self.metagraph.axons[self.metagraph.hotkeys.index(hotkey)].is_serving
+        ]
+
     def forward(self, job: Job) -> dict:
         """Carries out a query to the miners to check their progress on a given job (pdb) and updates the job status based on the results.
 
@@ -81,7 +100,7 @@ class Validator(BaseValidatorNeuron):
 
         protein = Protein.from_job(job=job, config=self.config.protein)
 
-        uids = [self.metagraph.hotkeys.index(hotkey) for hotkey in job.hotkeys]
+        uids = self.get_uids(hotkeys=job.hotkeys)
         # query the miners and get the rewards for their responses
         # Check check_uid_availability to ensure that the hotkeys are valid and active
         bt.logging.info("⏰ Waiting for miner responses ⏰")
@@ -94,10 +113,8 @@ class Validator(BaseValidatorNeuron):
         )
 
     def get_pdbs_to_exclude(self) -> List[str]:
-        # Set of pdbs that are currently in the process of running.
-        return [
-            queued_job.pdb for queued_job in self.store.get_queue(ready=False).queue
-        ]
+        # Set of pdbs that are currently in the process of running + old submitted simulations.
+        return list(self.store._db.index)
 
     def add_jobs(self, k: int):
         """Creates new jobs and assigns them to available workers. Updates DB with new records.
@@ -121,9 +138,7 @@ class Validator(BaseValidatorNeuron):
             active_jobs = self.store.get_queue(ready=False).queue
             active_hotkeys = [j.hotkeys for j in active_jobs]  # list of lists
             active_hotkeys = list(chain.from_iterable(active_hotkeys))
-            exclude_uids = [
-                self.metagraph.hotkeys.index(hotkey) for hotkey in active_hotkeys
-            ]
+            exclude_uids = self.get_uids(hotkeys=active_hotkeys)
 
             uids = get_random_uids(
                 self, self.config.neuron.sample_size, exclude=exclude_uids
@@ -143,6 +158,7 @@ class Validator(BaseValidatorNeuron):
                     water=job_event["water"],
                     box=job_event["box"],
                     hotkeys=selected_hotkeys,
+                    epsilon=job_event["epsilon"],
                     event=job_event,
                 )
 
@@ -152,8 +168,11 @@ class Validator(BaseValidatorNeuron):
         TODO: we also need to remove hotkeys that have not participated for some time (dereg or similar)
         """
 
+        top_reward = 0.80
+        apply_pipeline = False
+
         energies = torch.Tensor(job.event["energies"])
-        rewards = torch.zeros_like(energies)  # one-hot per update step
+        rewards = torch.zeros(len(energies))  # one-hot per update step
 
         # TODO: we need to get the commit and gro hashes from the best hotkey
         commit_hash = ""  # For next time
@@ -161,21 +180,17 @@ class Validator(BaseValidatorNeuron):
 
         # If no miners respond appropriately, the energies will be all zeros
         if (energies == 0).all():
-            if (
-                pd.Timestamp.now().floor("s") - job.created_at
-                > job.max_time_no_improvement
-            ):
-                if isinstance(job.best_loss_at, pd._libs.tslibs.nattype.NaTType):
-                    bt.logging.warning(
-                        f"Job {job.pdb} has not been updated since creation. Removing from queue."
-                    )
-                    job.active = False  # means that nothing has been sampled from any miners and not updated.
-
-            bt.logging.warning(
-                f"Received all zero energies for {job.pdb}... Not updating."
-            )
-
+            # All miners not responding but there is at least ONE miner that did in the past. Give them rewards.
+            if job.best_loss < np.inf:
+                apply_pipeline = True
+                bt.logging.warning(
+                    f"Received all zero energies for {job.pdb} but stored best_loss < np.inf... Giving rewards."
+                )
         else:
+            apply_pipeline = True
+            bt.logging.success("Non-zero energies received. Applying reward pipeline.")
+
+        if apply_pipeline:
             best_index = np.argmin(energies)
             best_loss = energies[best_index].item()  # item because it's a torch.tensor
             best_hotkey = job.hotkeys[best_index]
@@ -191,13 +206,18 @@ class Validator(BaseValidatorNeuron):
                 gro_hash=gro_hash,
             )
 
-            # note that the reward goes to current leader (even if they didn't do well this round)
-            rewards[job.hotkeys.index(job.best_hotkey)] = 1
+            rewards: torch.Tensor = reward_pipeline(
+                energies=energies, rewards=rewards, top_reward=top_reward, job=job
+            )
 
-            uids = [self.metagraph.hotkeys.index(hotkey) for hotkey in job.hotkeys]
+            uids = self.get_uids(hotkeys=job.hotkeys)
             self.update_scores(
                 rewards=rewards,
                 uids=uids,  # pretty confident these are in the correct order.
+            )
+        else:
+            bt.logging.warning(
+                f"All energies zero for job {job.pdb} and job has never been updated... Skipping"
             )
 
         # Finally, we update the job in the store regardless of what happened.
@@ -217,6 +237,7 @@ class Validator(BaseValidatorNeuron):
             rewards.numpy()
         )  # add the rewards to the logging event.
 
+        bt.logging.success(f"Event information: {merged_events}")
         log_event(self, event=prepare_event_for_logging(merged_events))
 
 
